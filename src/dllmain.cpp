@@ -10,10 +10,15 @@
 //                         chest's container into every same-guild camp's storage module. That lets the
 //                         native build/craft flow CONSUME cross-camp (and, on a host/SP authority, the
 //                         native collector already reads the merged containers -> correct display for free).
+//                         The storage module's container filter drops a chest whose camp is not the camp
+//                         being queried; during that query and the matching consume call, a same-guild camp
+//                         is reported as the querying camp so the pooled materials both show and get spent.
+//                         Recipe icons (production line, workbench) read GetItemStackCount64 off the local
+//                         camp's ItemStackInfo, so they stay red unless the other camps' counts are added.
 //
 //   REMOTE CLIENT       — can't see far-camp containers, so it DISPLAYS the guild total by minting local
 //                         item slots and array-swapping them into a spare inventory container ("cont5")
-//                         only for the duration of the native material scan (3 AOB-located detours). The
+//                         only for the duration of the native material scan (3 detours). The
 //                         per-item pool comes over a custom TRANSPORT CHANNEL (below), never the ISI.
 //
 //   TRANSPORT CHANNEL   — demand-driven, event-driven, ISI-free: the client tracks its current camp via the
@@ -22,7 +27,9 @@
 //                         container contents for (guild - own), and replies over an engine RPC; the client
 //                         parses it into the pool. No FindAllOf in any per-frame path.
 //
-// All patch sites are located by unique AOB signature at load (survives address-shifting game updates).
+// Patch sites are located at load from reflected function names and how often each function is called.
+// A site is hooked only when that walk has exactly one answer, so a game update that moves code still
+// resolves, and a walk that becomes ambiguous is skipped instead of hooking a neighbour.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -33,6 +40,7 @@
 #include <string>
 #include <fstream>
 #include <utility>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -324,64 +332,218 @@ static UObject* findDonorContainer() {
 }
 
 // ============================================================================
-//  AOB signature scanning (survives address-shifting game updates)
+//  Locate patch sites from function names (no byte signatures)
 // ============================================================================
-//! Locate each site at load by a wildcarded byte signature (relative/RIP operands wildcarded, struct offsets
-//! kept). Uniqueness in the module IS the correctness guard: exactly ONE match -> use it; ZERO or MANY ->
-//! skip loudly. If a function's BYTES change (not just its address), regenerate its sig from a fresh analysis.
-struct Sig { std::vector<uint8_t> b; std::vector<uint8_t> wild; };
-static Sig parseSig(const char* s) {
-    Sig sig;
-    auto hv = [](char c)->int { if (c>='0'&&c<='9') return c-'0'; if (c>='A'&&c<='F') return c-'A'+10;
-                                if (c>='a'&&c<='f') return c-'a'+10; return 0; };
-    for (const char* p = s; *p; ) {
-        if (*p == ' ') { ++p; continue; }
-        if (*p == '?') { sig.b.push_back(0); sig.wild.push_back(1); p += (p[1]=='?') ? 2 : 1; }
-        else { sig.b.push_back((uint8_t)((hv(p[0])<<4)|hv(p[1]))); sig.wild.push_back(0); p += 2; }
-    }
-    return sig;
+//! Each site is a C++ body reached from one reflected UFunction. Short names that exist on more than one
+//! class are never searched on their own: GetItemStackCount64 is taken from the class that owns
+//! OnReadyModuleItemStackInfo, and GetBaseCampBelongTo is the body behind the GetBaseCampModelBelongTo
+//! overload whose callee is not a shared helper. The remaining bodies are the uniquely least-called
+//! function on that walk. Zero or two answers skips the site.
+struct Target { const CharType* name; uint64_t tramp; PLH::x64Detour* det; bool hooked; uintptr_t addr; };
+static Target g_collect    = { STR("collector"),          0, nullptr, false, 0 };
+static Target g_7d0        = { STR("catalog"),            0, nullptr, false, 0 };
+static Target g_ac0        = { STR("placement"),          0, nullptr, false, 0 };
+static Target g_getIds     = { STR("GetContainerIds"),    0, nullptr, false, 0 };
+static Target g_campBelong = { STR("GetBaseCampBelongTo"),0, nullptr, false, 0 };
+static Target g_consume    = { STR("storage consume"),    0, nullptr, false, 0 };
+static Target g_stackCount = { STR("GetItemStackCount64"),0, nullptr, false, 0 };
+
+struct ResolvedSites {
+    uint32_t collector = 0, catalog = 0, placement = 0;
+    uint32_t getIds = 0, camp = 0, consume = 0, stack = 0;
+};
+static std::vector<std::pair<uint32_t, uint32_t>> g_fnSpan;   // .pdata (begin, end) RVAs
+static std::unordered_map<uint32_t, int> g_callers;           // direct-call target RVA -> caller count
+static uint32_t g_textLo = 0, g_textHi = 0;
+
+static int callerCount(uint32_t rva) {
+    auto it = g_callers.find(rva);
+    return it == g_callers.end() ? 0 : it->second;
 }
-struct ExecRange { const uint8_t* start; size_t size; };
-static std::vector<ExecRange> g_exec;
-static void initExecRanges(uintptr_t base) {
+static bool spanOf(uint32_t rva, uint32_t& begin, uint32_t& end) {
+    size_t lo = 0, hi = g_fnSpan.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (g_fnSpan[mid].first <= rva) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0) return false;
+    auto s = g_fnSpan[lo - 1];
+    if (rva < s.first || rva >= s.second) return false;
+    begin = s.first; end = s.second;
+    return true;
+}
+static void directCalls(uintptr_t base, uint32_t rva, std::vector<uint32_t>& out) {
+    uint32_t begin, end;
+    if (!spanOf(rva, begin, end)) return;
+    uint32_t size = end - begin;
+    if (size > 0x20000) size = 0x20000;
+    const uint8_t* p = (const uint8_t*)(base + begin);
+    for (uint32_t i = 0; i + 5 <= size; ++i) {
+        if (p[i] != 0xE8) continue;
+        int32_t rel; std::memcpy(&rel, p + i + 1, 4);
+        int64_t dest = (int64_t)begin + (int64_t)i + 5 + rel;
+        if (dest < (int64_t)g_textLo || dest >= (int64_t)g_textHi) continue;
+        uint32_t d = (uint32_t)dest;
+        if (std::find(out.begin(), out.end(), d) == out.end()) out.push_back(d);
+    }
+}
+static bool indexCalls(uintptr_t base) {
     auto* dos = (IMAGE_DOS_HEADER*)base;
     auto* nt  = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
     auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i)
-        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
-            g_exec.push_back({ (const uint8_t*)(base + sec[i].VirtualAddress), (size_t)sec[i].Misc.VirtualSize });
-}
-// scan every executable section; returns the unique match address (0 if none). *count is capped at 2 so
-// callers can distinguish not-found (0) from ambiguous (>=2).
-static uintptr_t scanSig(const Sig& s, int* count) {
-    const size_t n = s.b.size(); *count = 0;
-    if (n == 0) return 0;
-    const uint8_t b0 = s.b[0]; const bool w0 = s.wild[0] != 0;
-    uintptr_t found = 0; int c = 0;
-    for (auto& r : g_exec) {
-        if (r.size < n) continue;
-        const uint8_t* p = r.start; const size_t last = r.size - n;
-        for (size_t i = 0; i <= last; ++i) {
-            if (!w0 && p[i] != b0) continue;
-            size_t j = 1;
-            for (; j < n; ++j) if (!s.wild[j] && p[i+j] != s.b[j]) break;
-            if (j == n) { if (!found) found = (uintptr_t)(p + i); if (++c >= 2) { *count = c; return found; } }
-        }
+    const uint8_t* text = nullptr; size_t textSize = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (std::memcmp(sec[i].Name, ".text", 5) != 0 || sec[i].Name[5] != 0) continue;
+        g_textLo = sec[i].VirtualAddress;
+        textSize = sec[i].Misc.VirtualSize;
+        g_textHi = g_textLo + (uint32_t)textSize;
+        text = (const uint8_t*)(base + g_textLo);
+        break;
     }
-    *count = c; return found;
+    if (!text || textSize < 16) return false;
+    auto& exc = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!exc.VirtualAddress || exc.Size < sizeof(RUNTIME_FUNCTION)) return false;
+    auto* rt = (RUNTIME_FUNCTION*)(base + exc.VirtualAddress);
+    DWORD n = exc.Size / sizeof(RUNTIME_FUNCTION);
+    g_fnSpan.clear(); g_fnSpan.reserve(n);
+    for (DWORD i = 0; i < n; ++i)
+        if (rt[i].BeginAddress < rt[i].EndAddress)
+            g_fnSpan.emplace_back(rt[i].BeginAddress, rt[i].EndAddress);
+    std::sort(g_fnSpan.begin(), g_fnSpan.end());
+    g_callers.clear(); g_callers.reserve(n);
+    for (size_t i = 0; i + 5 <= textSize; ++i) {
+        if (text[i] != 0xE8) continue;
+        int32_t rel; std::memcpy(&rel, text + i + 1, 4);
+        int64_t dest = (int64_t)g_textLo + (int64_t)i + 5 + rel;
+        if (dest >= (int64_t)g_textLo && dest < (int64_t)g_textHi) g_callers[(uint32_t)dest] += 1;
+    }
+    return true;
+}
+static void functionsNamed(const CharType* name, std::vector<UFunction*>& out) {
+    std::vector<UObject*> found;
+    UObjectGlobals::FindObjects(STR("Function"), name, found);
+    for (UObject* o : found) if (o) out.push_back(static_cast<UFunction*>(o));
+}
+static UFunction* functionNamed(const CharType* name) {
+    std::vector<UFunction*> found;
+    functionsNamed(name, found);
+    return found.size() == 1 ? found[0] : nullptr;
+}
+static uint32_t execRva(uintptr_t base, UFunction* fn) {
+    if (!fn) return 0;
+    uintptr_t fp = (uintptr_t)fn->GetFuncPtr();
+    if (fp < base) return 0;
+    return (uint32_t)(fp - base);
+}
+//! The one direct call made by exactly `callers` places. Two such calls, or none, is not an answer.
+static uint32_t calleeCalledBy(uintptr_t base, uint32_t fn, int callers) {
+    std::vector<uint32_t> calls;
+    directCalls(base, fn, calls);
+    uint32_t hit = 0;
+    for (uint32_t c : calls) {
+        if (callerCount(c) != callers) continue;
+        if (hit) return 0;
+        hit = c;
+    }
+    return hit;
+}
+//! The least-called direct call inside [lo, hi]. A tie is not an answer.
+static uint32_t leastCalledCallee(uintptr_t base, uint32_t fn, int lo, int hi) {
+    std::vector<uint32_t> calls;
+    directCalls(base, fn, calls);
+    uint32_t hit = 0; int best = 0x7fffffff; int ties = 0;
+    for (uint32_t c : calls) {
+        int n = callerCount(c);
+        if (n < lo || n > hi) continue;
+        if (n < best) { best = n; hit = c; ties = 1; }
+        else if (n == best) ++ties;
+    }
+    return ties == 1 ? hit : 0;
+}
+static void callersOf(uintptr_t base, uint32_t dest, std::vector<uint32_t>& parents) {
+    if (!dest || g_textHi <= g_textLo) return;
+    const uint8_t* text = (const uint8_t*)(base + g_textLo);
+    size_t size = (size_t)g_textHi - g_textLo;
+    for (size_t i = 0; i + 5 <= size; ++i) {
+        if (text[i] != 0xE8) continue;
+        int32_t rel; std::memcpy(&rel, text + i + 1, 4);
+        int64_t d = (int64_t)g_textLo + (int64_t)i + 5 + rel;
+        if ((uint32_t)d != dest) continue;
+        uint32_t begin, end;
+        if (!spanOf(g_textLo + (uint32_t)i, begin, end)) continue;
+        if (std::find(parents.begin(), parents.end(), begin) == parents.end()) parents.push_back(begin);
+    }
+}
+static ResolvedSites resolveSites(uintptr_t base) {
+    ResolvedSites s;
+    if (!indexCalls(base)) return s;
+    try {
+        if (UFunction* ready = functionNamed(STR("OnReadyModuleItemStackInfo"))) {
+            UObject* cls = ready->GetOuterPrivate();
+            StringType path = cls ? cls->GetPathName() + STR(":GetItemStackCount64") : StringType();
+            auto* stack = cls ? static_cast<UFunction*>(UObjectGlobals::FindObject(STR("Function"), path.c_str())) : nullptr;
+            if (stack) s.stack = calleeCalledBy(base, execRva(base, stack), 1);
+        }
+        std::vector<UFunction*> camps;
+        functionsNamed(STR("GetBaseCampModelBelongTo"), camps);
+        for (UFunction* fn : camps) {
+            std::vector<uint32_t> calls; directCalls(base, execRva(base, fn), calls);
+            uint32_t body = 0; int moderate = 0;
+            for (uint32_t c : calls) {
+                int n = callerCount(c);
+                if (n < 1 || n > 500) continue;
+                body = c; ++moderate;
+            }
+            if (moderate != 1) continue;
+            if (s.camp) { s.camp = 0; break; }
+            s.camp = body;
+        }
+        if (UFunction* count = functionNamed(STR("CountLocalPlayerInsideBaseCampItemNum64"))) {
+            uint32_t helper = calleeCalledBy(base, execRva(base, count), 1);
+            if (helper) s.getIds = leastCalledCallee(base, helper, 2, 0x7fffffff);
+        }
+        if (UFunction* collect = functionNamed(STR("CollectLocalPlayerControllableItemInfos")))
+            s.collector = leastCalledCallee(base, execRva(base, collect), 2, 40);
+        uint32_t walk = s.collector ? leastCalledCallee(base, s.collector, 1, 20) : 0;
+        if (walk) {
+            std::vector<uint32_t> calls; directCalls(base, walk, calls);
+            uint32_t first = 0, second = 0; int f1 = 0x7fffffff, f2 = 0x7fffffff, n1 = 0, n2 = 0;
+            for (uint32_t c : calls) {
+                int n = callerCount(c); if (n < 1) continue;
+                if (n < f1) { f2 = f1; second = first; f1 = n; first = c; }
+                else if (n < f2) { f2 = n; second = c; }
+            }
+            for (uint32_t c : calls) { int n = callerCount(c); if (n == f1) ++n1; if (n == f2) ++n2; }
+            if (n1 == 1 && n2 == 1) {
+                s.placement = first;
+                std::vector<uint32_t> parents; callersOf(base, second, parents);
+                uint32_t parent = 0; int np = 0;
+                for (uint32_t p : parents) if (callerCount(p) == 1) { parent = p; ++np; }
+                if (np == 1) s.catalog = calleeCalledBy(base, parent, 1);
+            }
+        }
+        if (s.getIds) {
+            std::vector<uint32_t> parents; callersOf(base, s.getIds, parents);
+            bool clash = false;
+            for (uint32_t p : parents) {
+                std::vector<uint32_t> calls; directCalls(base, p, calls);
+                for (uint32_t c : calls) {
+                    if (c == s.getIds || callerCount(c) != 2) continue;
+                    if (s.consume && s.consume != c) clash = true;
+                    s.consume = c;
+                }
+            }
+            if (clash) s.consume = 0;
+        }
+    } catch (...) {}
+    g_fnSpan.clear(); g_callers.clear();
+    return s;
 }
 
 //! The 3 material-scan functions the remote client detours: collector (craft + build-confirm haves),
 //! catalog (build-open availability), placement (per-recipe placement counter). Real injected numbers make
 //! the native gates pass on their own (bisection 2026-07-17 removed the old "optimistic gate" overrides), so
-//! only these 3 remain. Re-verify unique on every game update.
-static const char* SIG_COLLECTOR = "48 89 5C 24 08 48 89 6C 24 18 48 89 74 24 20 48 89 54 24 10 57 41 56 41 57 48 83 EC 60 41 0F B6 E9 4D 8B F0 48 8B FA 48 8B F1 48 8B D1 48 8D 4C 24 48 E8 ?? ?? ?? ?? 48 8D 44 24 38 48 89 44 24 30";
-static const char* SIG_CATALOG   = "48 89 5C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F0 48 81 EC 10 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 00 4D 8B E8 4C 89 44 24 50 48 8B DA 33 FF 48 89 7D B0 48 89 7D B8 48 89 7D D0";
-static const char* SIG_PLACEMENT = "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D8 48 81 EC 28 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 10 4D 8B F9 4C 89 4C 24 58 4D 8B E0 48 8B DA 4C 89 45 88 33 FF 48 89 7D C0 48 89 7D C8";
-struct Target { const CharType* name; const char* sig; uint64_t tramp; PLH::x64Detour* det; bool hooked; uintptr_t addr; };
-static Target g_collect = { STR("collector"), SIG_COLLECTOR, 0, nullptr, false, 0 };
-static Target g_7d0     = { STR("catalog"),   SIG_CATALOG,   0, nullptr, false, 0 };
-static Target g_ac0     = { STR("placement"), SIG_PLACEMENT, 0, nullptr, false, 0 };
+//! only these 3 remain.
 
 //! Each detour (remote client only): tick + transient array-swap cont5's slots -> our minted buffer around
 //! the native scan, restore after. Outermost-only guard because these functions nest. On the authority the
@@ -426,7 +588,8 @@ static int64_t __fastcall hkAc0(void* a1, void* a2, void* r, void* o) {
 // ============================================================================
 //  SERVER — discovery reconcile + container cross-registration (authority only)
 // ============================================================================
-static const wchar_t*  SRV_CHEST_CLASS  = L"PalMapObjectItemChestModel";
+static const wchar_t*  SRV_CHEST_CLASS   = L"PalMapObjectItemChestModel";
+static const wchar_t*  SRV_STORAGE_CLASS = L"PalMapObjectItemStorageModel";   // fridge / container / cooler family
 static const uintptr_t OFF_CAMP_MODULES = 0x180;   // UPalBaseCampModel.ModuleArray (TArray<module*>)
 static const uintptr_t OFF_CAMP_GROUPID = 0xE4;    // UPalBaseCampModel.GroupIdBelongTo (FGuid) -> guild key
 
@@ -437,6 +600,10 @@ struct GuildData {
 };
 static std::unordered_map<std::wstring, GuildData> g_guilds;
 static std::unordered_map<std::wstring, UObject*> g_instToCamp;  // chest map-object instance-id (hex) -> its camp
+static std::unordered_map<UObject*, UObject*> g_storageToCamp;   // storage module -> its camp (camp-gate lookup)
+//! camp -> (item FName bits -> stack count) of that camp's chests. Rebuilt each reconcile. GetItemStackCount64
+//! already returns the querying camp; the recipe-icon hook adds every OTHER same-guild camp from this map.
+static std::unordered_map<UObject*, std::unordered_map<uint64_t, int64_t>> g_campItemCounts;
 static bool g_srvInjecting = false;   // re-entrancy guard (our cross-register calls re-fire the storage events)
 
 //! walk the UClass chain for an exact class name
@@ -466,7 +633,9 @@ static UObject* srvCampModelOf(UObject* chest) {
 }
 //! a camp's storage module by walking its ModuleArray (no scan)
 static UObject* srvStorageOf(UObject* camp) {
-    RawTArray* mods = (RawTArray*)((uint8_t*)camp + OFF_CAMP_MODULES);
+    // Reflected name first: OFF_CAMP_MODULES is a layout guess and drifts when PalBaseCampModel grows.
+    RawTArray* mods = camp->GetValuePtrByPropertyNameInChain<RawTArray>(STR("ModuleArray"));
+    if (!mods) mods = (RawTArray*)((uint8_t*)camp + OFF_CAMP_MODULES);
     if (!mods->data || mods->num <= 0 || mods->num > 64) return nullptr;
     for (int i = 0; i < mods->num; ++i) { UObject* m = ((UObject**)mods->data)[i]; if (m && srvClassIs(m, L"PalBaseCampModuleItemStorage")) return m; }
     return nullptr;
@@ -475,7 +644,7 @@ static UObject* srvStorageOf(UObject* camp) {
 //! DISCOVERY RECONCILE (authority; ~8s correctness pass). Rebuilds guild state from GROUND TRUTH and
 //! cross-registers every guild chest's model into every same-guild camp's storage module so the native
 //! build/craft flow can CONSUME cross-camp. Two enumerations:
-//!   (a) every chest concrete model from the UPalMapObjectManager (TMap @0x310, raw sparse-array walk, no
+//!   (a) every chest concrete model from the UPalMapObjectManager (TMap @0x328, raw sparse-array walk, no
 //!       FindAllOf) -> group by CURRENT camp + guild; also record instance-id -> camp for the channel read.
 //!   (b) EVERY base camp incl. EMPTY ones (FindAllOf) -> add its storage to its guild bucket so an empty
 //!       camp is a cross-registration TARGET. Without (b) an empty camp is never discovered (discovery is
@@ -487,7 +656,7 @@ static void srvDiscoverReconcile() {
     if (g_isSrv != 1) return;
     UObject* mgr = UObjectGlobals::FindFirstOf(STR("PalMapObjectManager"));
     if (!mgr) return;
-    uint8_t* mm = (uint8_t*)mgr + 0x310;                        // MapObjectConcreteModelMapForServer (TMap)
+    uint8_t* mm = (uint8_t*)mgr + 0x328;                        // MapObjectConcreteModelMapForServer (TMap); was 0x310
     uint8_t* elems  = *(uint8_t**)(mm + 0x00);                  // sparse-array element buffer
     int32_t  maxIdx = *(int32_t*)(mm + 0x08);                   // slots incl. holes (== NumBits)
     uint32_t* words = *(uint32_t**)(mm + 0x20); if (!words) words = (uint32_t*)(mm + 0x10);   // allocation bits
@@ -499,7 +668,7 @@ static void srvDiscoverReconcile() {
         if (((words[i >> 5] >> (i & 31)) & 1u) == 0) continue;                 // skip free slots
         uint8_t*  keyId = elems + (size_t)i * 0x20 + 0x00;                     // TPair::Key = FGuid instance id
         UObject* model  = *(UObject**)(elems + (size_t)i * 0x20 + 0x10);       // TPair::Value = concrete model
-        if (!model || !srvClassIs(model, SRV_CHEST_CLASS)) continue;
+        if (!model || (!srvClassIs(model, SRV_CHEST_CLASS) && !srvClassIs(model, SRV_STORAGE_CLASS))) continue;
         UObject* camp = srvCampModelOf(model); if (!camp) continue;
         GuildData& g = fresh[srvGuildKey(camp)];
         g.models.insert(model); g.modelCamp[model] = camp;
@@ -520,7 +689,87 @@ static void srvDiscoverReconcile() {
     g_srvInjecting = false;
     g_guilds = std::move(fresh);
     g_instToCamp = std::move(freshInst);
+    g_storageToCamp.clear();
+    for (auto& gkv : g_guilds) for (auto& sc : gkv.second.storageCamp) g_storageToCamp[sc.first] = sc.second;
+    { std::unordered_map<UObject*, std::unordered_map<uint64_t, int64_t>> counts;
+      std::vector<UObject*> conts; UObjectGlobals::FindAllOf(STR("PalItemContainer"), conts);
+      for (UObject* c : conts) { if (!c) continue;
+          uint8_t* cp = (uint8_t*)c;
+          if (guidZero(cp + OFF_CONT_OWNER)) continue;
+          wchar_t ih[33]; hexOf(cp + OFF_CONT_OWNER, ih);
+          auto it = g_instToCamp.find(ih); if (it == g_instToCamp.end()) continue;
+          RawTArray* slots = (RawTArray*)(cp + OFF_CONT_SLOTS);
+          if (!slots->data || slots->num <= 0 || slots->num > 4096) continue;
+          auto& bucket = counts[it->second];
+          for (int i = 0; i < slots->num; ++i) {
+              UObject* slot = ((UObject**)slots->data)[i]; if (!slot) continue;
+              int32_t cnt = *(int32_t*)((uint8_t*)slot + OFF_SLOT_COUNT); if (cnt <= 0) continue;
+              bucket[*(uint64_t*)((uint8_t*)slot + OFF_SLOT_ITEMID)] += cnt; } }
+      g_campItemCounts = std::move(counts); }
     if (g_verbose && g_recLog < 8) { ++g_recLog; Output::send(STR("[ISGATE] SRV discover: chests={} camps={} guilds={} inst={}\n"), chests, campsSeen, (int)g_guilds.size(), (int)g_instToCamp.size()); }
+}
+
+// ============================================================================
+//  CAMP GATE — let the storage filter accept same-guild chests (authority)
+// ============================================================================
+//! GetContainerIds (material display) and the storage consume (build/craft click) share one filter: a
+//! ContainerInfos entry is kept only when GetBaseCampBelongTo(model) equals the querying camp.
+//! Cross-registered chests fail that compare. While either call is on the stack for a storage we know,
+//! a same-guild camp is reported as the querying camp. Outside those two calls the function is unchanged.
+static thread_local UObject* g_campOverride = nullptr;   // camp whose storage is being queried on this thread
+typedef void(__fastcall* tGetContainerIds)(void*, void*, void*);
+typedef UObject*(__fastcall* tCampBelongTo)(UObject*);
+typedef uint8_t(__fastcall* tStorageConsume)(void*, uint64_t, int32_t, void*);   // (storage, FName id, count, playerUId)
+static UObject* campOfStorage(void* st) {
+    if (g_isSrv != 1) return nullptr;
+    auto it = g_storageToCamp.find((UObject*)st);
+    return it == g_storageToCamp.end() ? nullptr : it->second;
+}
+static void __fastcall hkGetContainerIds(void* st, void* out, void* option) {
+    UObject* prev = g_campOverride;
+    g_campOverride = campOfStorage(st);
+    reinterpret_cast<tGetContainerIds>(g_getIds.tramp)(st, out, option);
+    g_campOverride = prev;
+}
+//! Recipe-list colour calls GetItemStackCount64, which sums only the querying camp's ItemStackInfo.
+//! Record that camp while the native runs, then add the other same-guild camps (host) or g_pool (remote client).
+static thread_local int g_stackCountDepth = 0;
+static thread_local UObject* g_stackCountCamp = nullptr;
+typedef int64_t(__fastcall* tStackCount)(void*, uint64_t);
+static int64_t extraStackCount(UObject* camp, uint64_t id) {
+    if (g_isSrv == 0) { FName fn; std::memcpy(&fn, &id, sizeof fn); int32_t p = poolGet(fn); return p > 0 ? p : 0; }
+    if (g_isSrv != 1 || !camp) return 0;
+    std::wstring guild = srvGuildKey(camp);
+    int64_t extra = 0;
+    for (auto& kv : g_campItemCounts) {
+        if (kv.first == camp || srvGuildKey(kv.first) != guild) continue;
+        auto it = kv.second.find(id); if (it != kv.second.end()) extra += it->second;
+    }
+    return extra;
+}
+static int64_t __fastcall hkStackCount(void* self, uint64_t id) {
+    UObject* prev = g_stackCountCamp;
+    ++g_stackCountDepth; g_stackCountCamp = nullptr;
+    int64_t n = reinterpret_cast<tStackCount>(g_stackCount.tramp)(self, id);
+    UObject* camp = g_stackCountCamp;
+    --g_stackCountDepth; g_stackCountCamp = prev;
+    int64_t extra = extraStackCount(camp, id);
+    if (extra > 0 && n < INT64_MAX - extra) n += extra;
+    return n;
+}
+static UObject* __fastcall hkCampBelongTo(UObject* model) {
+    UObject* real = reinterpret_cast<tCampBelongTo>(g_campBelong.tramp)(model);
+    if (g_stackCountDepth > 0 && !g_stackCountCamp) g_stackCountCamp = real;
+    if (!g_campOverride || !real || real == g_campOverride) return real;
+    if (srvGuildKey(real) != srvGuildKey(g_campOverride)) return real;
+    return g_campOverride;
+}
+static uint8_t __fastcall hkStorageConsume(void* st, uint64_t id, int32_t num, void* uid) {
+    UObject* prev = g_campOverride;
+    g_campOverride = campOfStorage(st);
+    uint8_t r = reinterpret_cast<tStorageConsume>(g_consume.tramp)(st, id, num, uid);
+    g_campOverride = prev;
+    return r;
 }
 
 // ============================================================================
@@ -781,7 +1030,7 @@ static void installChannel() {
 //! new in-game world.
 static UObject* g_lastWorld = nullptr;
 static void resetState() {
-    g_guilds.clear(); g_instToCamp.clear();
+    g_guilds.clear(); g_instToCamp.clear(); g_storageToCamp.clear(); g_campItemCounts.clear();
     for (UObject* s : g_mintedSlots) if (s) s->ClearRootSet();   // unroot so the old world's minted slots can be GC'd
     g_mintedSlots.clear();
     g_common = nullptr; g_donorCont = nullptr;
@@ -848,13 +1097,13 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.2");   // 3.2 (public): cont5 APPEND (no implant loss) + donor-pin + __finally + out-of-camp gate + role-caching fix + FindFirstOf caching
-        ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7");
+        ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel.");
         ModAuthors = STR("Sarfflow");
     }
     ~ModIntegratedStorageCpp() override
     {
-        for (Target* t : { &g_collect, &g_7d0, &g_ac0 })
+        for (Target* t : { &g_collect, &g_7d0, &g_ac0, &g_getIds, &g_campBelong, &g_consume, &g_stackCount })
             if (t->det) { if (t->hooked) t->det->unHook(); delete t->det; t->det = nullptr; }
         for (UObject* s : g_mintedSlots) if (s) s->ClearRootSet();   // release the rooted minted slots on unload/hot-reload (else they leak in the root set)
         g_mintedSlots.clear();
@@ -865,16 +1114,20 @@ public:
         const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
         Output::send(STR("[ISGATE] === IntegratedStorage {} loaded, base {:#x} ===\n"), ModVersion, base);
         Output::send(STR("[ISGATE] config: verbose={} reconcile_ms={}\n"), g_verbose, (int)g_reconcileMs);
-        initExecRanges(base);
-        Output::send(STR("[ISGATE] exec sections={}\n"), (int)g_exec.size());
-        auto maybe = [&](bool en, Target& t, uint64_t cb) {
-            if (en) install(base, t, cb);
-            else Output::send(STR("[ISGATE] {} OFF\n"), t.name);
+        ResolvedSites sites = resolveSites(base);
+        auto maybe = [&](bool en, Target& t, uint32_t rva, uint64_t cb) {
+            if (!en) { Output::send(STR("[ISGATE] {} OFF\n"), t.name); return; }
+            install(base, t, rva, cb);
         };
         //! CLIENT display detours (gated at runtime by isClient(); pure pass-through on the authority).
-        maybe(EN_COLLECT,   g_collect, (uint64_t)&hkCollect);
-        maybe(EN_CATALOG,   g_7d0,     (uint64_t)&hk7d0);
-        maybe(EN_PLACEMENT, g_ac0,     (uint64_t)&hkAc0);
+        maybe(EN_COLLECT,   g_collect, sites.collector, (uint64_t)&hkCollect);
+        maybe(EN_CATALOG,   g_7d0,     sites.catalog,   (uint64_t)&hk7d0);
+        maybe(EN_PLACEMENT, g_ac0,     sites.placement, (uint64_t)&hkAc0);
+        //! Authority: storage-filter camp gate (no-op until a reconcile has mapped storages to camps).
+        install(base, g_getIds,     sites.getIds,  (uint64_t)&hkGetContainerIds);
+        install(base, g_campBelong, sites.camp,    (uint64_t)&hkCampBelongTo);
+        install(base, g_consume,    sites.consume, (uint64_t)&hkStorageConsume);
+        install(base, g_stackCount, sites.stack,   (uint64_t)&hkStackCount);
         //! Transport channel hooks (both ends; role-gated inside the handlers). Server consume is the ~8s
         //! reconcile in on_update. Native ISI is never touched.
         installChannel();
@@ -913,14 +1166,13 @@ public:
         if (g_lastReconcile == 0 || now - g_lastReconcile >= g_reconcileMs) { g_lastReconcile = now; srvDiscoverReconcile(); }
     }
 private:
-    auto install(uintptr_t base, Target& t, uint64_t cb) -> void {
-        Sig s = parseSig(t.sig); int cnt = 0;
-        uintptr_t addr = scanSig(s, &cnt);
-        if (cnt != 1) { Output::send(STR("[ISGATE] {} SIG {} — skipped\n"), t.name, cnt == 0 ? STR("NOT FOUND") : STR("AMBIGUOUS")); return; }
+    auto install(uintptr_t base, Target& t, uint32_t rva, uint64_t cb) -> void {
+        if (!rva) { Output::send(STR("[ISGATE] {} NOT FOUND — skipped\n"), t.name); return; }
+        uintptr_t addr = base + rva;
         t.addr = addr;
         t.det = new PLH::x64Detour((uint64_t)addr, cb, &t.tramp);
         t.hooked = t.det->hook();
-        Output::send(STR("[ISGATE] {} @ {:#x} (rva {:#x}) hooked={}\n"), t.name, addr, addr - base, t.hooked);
+        Output::send(STR("[ISGATE] {} @ {:#x} (rva {:#x}) hooked={}\n"), t.name, addr, (uintptr_t)rva, t.hooked);
     }
 };
 
